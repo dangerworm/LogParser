@@ -1,40 +1,34 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Drawing;
-using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Windows.Forms;
-using System.Xml.Schema;
 
-namespace IISLogViewer
+namespace LogParser
 {
     public partial class Main : Form
     {
         private const string ControlNameFormatString = "ctlConstraint{0}";
+        private const int ComboBoxLeft = 80;
+        private const int TextBoxLeft = 207;
+        private const int Spacing = 27;
 
-        private Dictionary<int, Constraint> _constraints;
-        private List<string> _fields;
-        private List<string[]> _rows;
+        private readonly Dictionary<int, Constraint> _constraints;
+        private readonly LogFileParser _fileParser;
 
-        private bool _hasDateField;
-        private bool _hasTimeField;
-        private int _dateFieldIndex;
-        private int _timeFieldIndex;
-
-        private int comboBoxLeft = 80;
-        private int textBoxLeft = 207;
-        private int spacing = 27;
+        private List<LogFileField> _fields;
+        private List<string[]> _outputLines;
 
         public Main()
         {
             InitializeComponent();
 
             _constraints = new Dictionary<int, Constraint>();
-            _hasDateField = false;
-            _hasTimeField = false;
-            _dateFieldIndex = -1;
-            _timeFieldIndex = -1;
+            _fields = new List<LogFileField>();
+            _fileParser = new LogFileParser();
+
+            _fileParser.FileLineProcessed += FileLineProcessed;
 
             dtpFrom.Value = DateTime.Today;
             dtpTo.Value = DateTime.Now;
@@ -42,42 +36,20 @@ namespace IISLogViewer
 
         private void btnSelectFile_Click(object sender, EventArgs e)
         {
-            if (ofdFilename.ShowDialog(this) != DialogResult.Cancel && ofdFilename.FileNames.Length > 0)
+            var openFileDialogResult = ofdFilename.ShowDialog(this);
+            if (openFileDialogResult == DialogResult.Cancel ||
+                string.IsNullOrWhiteSpace(ofdFilename.FileName) ||
+                ofdFilename.FileNames.Length == 0)
             {
-                tslStatus.Text = ofdFilename.FileNames.Length == 1 
-                    ? $"Loaded file {ofdFilename.FileName}" 
-                    : $"Loaded {ofdFilename.FileNames.Length} files";
+                return;
             }
 
-            try
-            {
-                var minDate = DateTime.MaxValue;
-                var maxDate = DateTime.MinValue;
-                foreach (var fileName in ofdFilename.FileNames)
-                {
-                    var yymmdd = Path.GetFileName(fileName ?? "").Substring(4, 6);
-                    var logDate = DateTime.ParseExact(yymmdd, "yyMMdd", CultureInfo.InvariantCulture);
-
-                    if (logDate < minDate)
-                    {
-                        minDate = logDate.Date;
-                        continue;
-                    }
-
-                    if (logDate > maxDate)
-                    {
-                        maxDate = logDate.Date;
-                    }
-                }
-
-                dtpFrom.Value = minDate;
-                dtpTo.Value = maxDate + new TimeSpan(23, 59, 59);
-            }
-            catch (Exception)
-            {
-            }
-
+            GetDateRange();
             LoadFields();
+
+            tslStatus.Text = ofdFilename.FileNames.Length == 1
+                ? $"Loaded file {ofdFilename.FileName}."
+                : $"Loaded {ofdFilename.FileNames.Length} files.";
         }
 
         private void btnProcessFile_Click(object sender, EventArgs e)
@@ -86,41 +58,28 @@ namespace IISLogViewer
             WriteRows();
         }
 
+        private void GetDateRange()
+        {
+            var dateRange = LogFileParser.GetDateRange(ofdFilename.FileNames);
+            dtpFrom.Value = dateRange.GetMinDateTime();
+            dtpTo.Value = dateRange.GetMaxDateTime();
+        }
+
         private void LoadFields()
         {
+            if (string.IsNullOrWhiteSpace(ofdFilename.FileName))
+            {
+                return;
+            }
+
             if (_fields?.Count > 0)
             {
                 UnloadFields();
             }
 
-            using (var input = new StreamReader(new FileStream(ofdFilename.FileName, FileMode.Open)))
-            {
-                // Useless
-                input.ReadLine(); // Software
-                input.ReadLine(); // Version
-                input.ReadLine(); // Date
+            _fields = _fileParser.GetFields(ofdFilename.FileName);
 
-                _fields = input.ReadLine()?.Split(' ').ToList(); // Fields
-                if (_fields == null)
-                {
-                    return;
-                }
-                _fields.RemoveAt(0); // Remove "#Fields" string from list
-
-                if (_fields.Contains("date"))
-                {
-                    _hasDateField = true;
-                    _dateFieldIndex = _fields.IndexOf("date");
-                }
-
-                if (_fields.Contains("time"))
-                {
-                    _hasTimeField = true;
-                    _timeFieldIndex = _fields.IndexOf("time");
-                }
-
-                AddConstraintInput();
-            }
+            AddConstraintInput();
         }
 
         private void AddConstraintInput()
@@ -128,21 +87,21 @@ namespace IISLogViewer
             var index = _constraints.Count;
 
             var controlName = string.Format(ControlNameFormatString, index);
-            var nonDateTimeFields = _fields.Where(f => _fields.IndexOf(f) != _dateFieldIndex &&
-                                                       _fields.IndexOf(f) != _timeFieldIndex)
-                .Select(f => (object)f)
+            var nonDateTimeFields = _fields
+                .Where(f => !f.IsDateField && !f.IsTimeField)
                 .ToArray();
 
             var comboBox = new ComboBox
             {
                 DropDownStyle = ComboBoxStyle.DropDownList,
-                Location = new Point(comboBoxLeft, index * spacing + 71),
+                Location = new Point(ComboBoxLeft, index * Spacing + 71),
                 Name = controlName,
                 Size = new Size(121, 21),
                 Tag = index
             };
+
             comboBox.Items.Add("No Filter");
-            comboBox.Items.AddRange(nonDateTimeFields);
+            comboBox.Items.AddRange(nonDateTimeFields.Select(f => (object)f.Name).ToArray());
             comboBox.SelectedIndex = 0;
             comboBox.SelectedIndexChanged += UpdateConstraintField;
             Controls.Add(comboBox);
@@ -150,7 +109,7 @@ namespace IISLogViewer
             var textBox = new TextBox
             {
                 Size = new Size(277, 21),
-                Location = new Point(textBoxLeft, index * spacing + 71),
+                Location = new Point(TextBoxLeft, index * Spacing + 71),
                 Name = controlName,
                 Tag = index
             };
@@ -180,14 +139,19 @@ namespace IISLogViewer
             }
 
             var index = int.Parse(tag);
-            var fieldIndex = _fields.IndexOf(comboBox.SelectedItem.ToString());
+            var field = _fields.FirstOrDefault(x => x.Name.Equals(comboBox.SelectedItem));
+            if (field == null)
+            {
+                return;
+            }
+
             if (!_constraints.ContainsKey(index))
             {
-                _constraints.Add(index, new Constraint { FieldIndex = fieldIndex });
+                _constraints.Add(index, new Constraint { FieldIndex = field.Index });
             }
             else
             {
-                _constraints[index].FieldIndex = fieldIndex;
+                _constraints[index].FieldIndex = field.Index;
             }
         }
 
@@ -264,62 +228,14 @@ namespace IISLogViewer
             tspProgress.Maximum = ofdFilename.FileNames.Sum(filename => File.ReadLines(filename).Count());
             tspProgress.Visible = true;
 
-            tslStatus.Text = $"Found {tspProgress.Maximum.ToString("N0")} log entries. Processing...";
+            tslStatus.Text = $@"Found {tspProgress.Maximum:N0} log entries. Processing...";
             Application.DoEvents();
 
-            _rows = new List<string[]>();
+            _outputLines = new List<string[]>();
+            var dateRange = new DateRange(dtpFrom.Value, dtpTo.Value);
             foreach (var filename in ofdFilename.FileNames)
             {
-                using (var input = new StreamReader(new FileStream(filename, FileMode.Open)))
-                {
-                    // Useless
-                    input.ReadLine(); // Software
-                    input.ReadLine(); // Version
-                    input.ReadLine(); // Date
-                    input.ReadLine(); // Fields
-
-                    string line;
-                    while (!string.IsNullOrEmpty(line = input.ReadLine()))
-                    {
-                        var row = line.Split(' ');
-
-                        var rowDate = DateTime.MinValue;
-                        if (_hasDateField)
-                        {
-                            rowDate = DateTime.Parse(row[_dateFieldIndex]);
-
-                            if (_hasTimeField)
-                            {
-                                rowDate += TimeSpan.Parse(row[_timeFieldIndex]);
-                            }
-                        }
-
-                        var inDateBand = true;
-                        if (_hasDateField && rowDate > DateTime.MinValue)
-                        {
-                            inDateBand = rowDate >= dtpFrom.Value && rowDate <= dtpTo.Value;
-                        }
-
-                        var isMatch = true;
-                        foreach (var constraint in _constraints.Values)
-                        {
-                            isMatch = row[constraint.FieldIndex].ToLower().Contains(constraint.Value.ToLower());
-                            if (!isMatch)
-                            {
-                                break;
-                            }
-                        }
-
-                        if (inDateBand && isMatch)
-                        {
-                            _rows.Add(row.Select(field => field.Contains(",") ? $"\"{field}\"" : $"{field}").ToArray());
-                        }
-
-                        tspProgress.Value++;
-
-                        Application.DoEvents();
-                    }
-                }
+                _outputLines = _fileParser.ProcessFile(filename, dateRange, _constraints.Values);
             }
 
             tspProgress.Visible = false;
@@ -351,13 +267,13 @@ namespace IISLogViewer
 
             using (var output = new StreamWriter(new FileStream(newPath, FileMode.CreateNew)))
             {
-                output.WriteLine(string.Join(",", _fields));
+                output.WriteLine(string.Join(",", _fields.Select(f => f.Name)));
 
                 tspProgress.Value = 0;
-                tspProgress.Maximum = _rows.Count;
+                tspProgress.Maximum = _outputLines.Count;
                 tspProgress.Visible = true;
 
-                foreach (var row in _rows)
+                foreach (var row in _outputLines)
                 {
                     output.WriteLine(string.Join(",", row));
 
@@ -368,7 +284,14 @@ namespace IISLogViewer
                 tspProgress.Visible = false;
             }
 
-            tslStatus.Text = $"Wrote new file {newPath}";
+            tslStatus.Text = $@"Wrote new file {newPath}";
+        }
+
+        private void FileLineProcessed(object sender, EventArgs e)
+        {
+            tspProgress.Value++;
+
+            Application.DoEvents();
         }
     }
 }

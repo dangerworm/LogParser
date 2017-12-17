@@ -1,4 +1,4 @@
-﻿namespace IISLogViewer
+﻿namespace LogParser
 {
     partial class Main
     {

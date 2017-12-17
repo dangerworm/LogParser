@@ -1,4 +1,4 @@
-﻿namespace IISLogViewer
+﻿namespace LogParser
 {
     public class Constraint
     {

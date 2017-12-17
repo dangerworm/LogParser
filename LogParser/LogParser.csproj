@@ -47,6 +47,9 @@
   </ItemGroup>
   <ItemGroup>
     <Compile Include="Constraint.cs" />
+    <Compile Include="DateRange.cs" />
+    <Compile Include="LogFileField.cs" />
+    <Compile Include="LogFileParser.cs" />
     <Compile Include="Main.cs">
       <SubType>Form</SubType>
     </Compile>
